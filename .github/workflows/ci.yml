@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Composer
-        run: curl -sS https://getcomposer.org/installer | php
+        run: php -r "copy('https://getcomposer.org/composer-stable.phar', 'composer.phar');"
 
       - name: Pin Symfony ${{ matrix.symfony }}
         run: |
