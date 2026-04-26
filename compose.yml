@@ -1,10 +1,31 @@
 services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: spawn_test
+      POSTGRES_USER: spawn
+      POSTGRES_PASSWORD: spawn
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "spawn"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
   dev:
     image: trueasync/php-true-async:latest
     working_dir: /app
     volumes:
       - .:/app
     command: php -v
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGSQL_HOST: postgres
+      PGSQL_PORT: 5432
+      PGSQL_DB: spawn_test
+      PGSQL_USER: spawn
+      PGSQL_PASSWORD: spawn
 
   tests:
     image: trueasync/php-true-async:latest
@@ -12,3 +33,12 @@ services:
     volumes:
       - .:/app
     command: php vendor/bin/phpunit --colors=always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGSQL_HOST: postgres
+      PGSQL_PORT: 5432
+      PGSQL_DB: spawn_test
+      PGSQL_USER: spawn
+      PGSQL_PASSWORD: spawn

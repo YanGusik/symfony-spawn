@@ -7,6 +7,7 @@ use Async\FutureState;
 use Async\Scope;
 use Spawn\Symfony\Contracts\ServerInterface;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
+use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Component\HttpKernel\TerminableInterface;
 
 class DevServer implements ServerInterface
@@ -22,11 +23,6 @@ class DevServer implements ServerInterface
     public function __destruct()
     {
         $this->serverScope?->dispose();
-    }
-
-    public function prepareApp(): void
-    {
-        // Async adapters and DB pool configured here in later stages.
     }
 
     public function start(): void
@@ -48,6 +44,11 @@ class DevServer implements ServerInterface
         });
 
         $serverScope->spawn(function () use ($serverScope) {
+            // Pool must be warmed up inside the first coroutine — the TrueAsync
+            // scheduler is not running until spawn() is called, so warming up
+            // before this point would create a plain PDO, not a pooled one.
+            $this->warmUpDatabasePool();
+
             $socket = stream_socket_server("tcp://{$this->host}:{$this->port}");
 
             if ($socket === false) {
@@ -81,6 +82,32 @@ class DevServer implements ServerInterface
         } catch (\Async\AsyncCancellation) {
             $serverScope->cancel();
             $this->serverScope = null;
+        }
+    }
+
+    private function warmUpDatabasePool(): void
+    {
+        if (!$this->kernel instanceof KernelInterface) {
+            return;
+        }
+
+        $container = $this->kernel->getContainer();
+
+        if (!$container->hasParameter('doctrine.connections')) {
+            return;
+        }
+
+        foreach ($container->getParameter('doctrine.connections') as $name => $serviceId) {
+            if (!$container->has($serviceId)) {
+                continue;
+            }
+
+            try {
+                $container->get($serviceId)->connect();
+                echo "[async] DB pool warmed up: {$name}\n";
+            } catch (\Throwable $e) {
+                echo "[async] DB pool warm-up ({$name}) failed: {$e->getMessage()}\n";
+            }
         }
     }
 

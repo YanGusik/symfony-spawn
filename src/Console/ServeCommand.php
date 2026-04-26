@@ -33,7 +33,6 @@ class ServeCommand extends Command
         $output->writeln("Starting TrueAsync server on <info>tcp://{$host}:{$port}</info>");
 
         $server = new DevServer($this->kernel, $host, $port);
-        $server->prepareApp();
         $server->start();
 
         return Command::SUCCESS;

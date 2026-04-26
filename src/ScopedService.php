@@ -15,5 +15,7 @@ enum ScopedService
     case SECURITY_INITIALIZER;
     case REQUEST_CONTEXT;
     case LOCALE;
-    case FALLBACK_LOCALES;
+    case DB_TX_NESTING;
+    case DB_ROLLBACK_ONLY;
+    case DB_IN_BEGIN;
 }

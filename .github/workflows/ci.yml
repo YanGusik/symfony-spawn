@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  tests:
+    name: Symfony ${{ matrix.symfony }}
+    runs-on: ubuntu-latest
+    container:
+      image: trueasync/php-true-async:latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        symfony: ['^7.0', '^8.0']
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: spawn_test
+          POSTGRES_USER: spawn
+          POSTGRES_PASSWORD: spawn
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-retries 10
+
+    env:
+      PGSQL_HOST: postgres
+      PGSQL_PORT: 5432
+      PGSQL_DB: spawn_test
+      PGSQL_USER: spawn
+      PGSQL_PASSWORD: spawn
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Composer
+        run: curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+      - name: Pin Symfony ${{ matrix.symfony }}
+        run: |
+          composer require \
+            "symfony/framework-bundle:${{ matrix.symfony }}" \
+            "symfony/runtime:${{ matrix.symfony }}" \
+            "symfony/security-core:${{ matrix.symfony }}" \
+            --no-update --no-interaction
+
+      - name: Install dependencies
+        run: composer update --prefer-dist --no-interaction
+
+      - name: Run tests
+        run: vendor/bin/phpunit

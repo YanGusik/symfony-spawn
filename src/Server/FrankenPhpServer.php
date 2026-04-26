@@ -17,11 +17,6 @@ class FrankenPhpServer implements ServerInterface
         private readonly HttpKernelInterface $kernel,
     ) {}
 
-    public function prepareApp(): void
-    {
-        // Async adapters and DB pool configured here in later stages.
-    }
-
     public function start(): void
     {
         if (!class_exists(FrankenHttpServer::class)) {
@@ -59,17 +54,7 @@ class FrankenPhpServer implements ServerInterface
         });
     }
 
-    /**
-     * Build a Symfony Request from the TrueAsync FrankenPHP request.
-     *
-     * TrueAsync FrankenPHP async mode does NOT populate $_SERVER superglobals.
-     * We build the request manually from FrankenPHP\Request methods:
-     *   getUri()       — original request URI (path + query string)
-     *   getMethod()    — HTTP method
-     *   getHeaders()   — request headers in UPPERCASE keys
-     *   getBody()      — raw request body
-     *   getRemoteAddr() — client IP:port
-     */
+    // TrueAsync FrankenPHP does not populate $_SERVER, build the request manually.
     private function buildRequest(FrankenRequest $frankenRequest): Request
     {
         $uri     = $frankenRequest->getUri();

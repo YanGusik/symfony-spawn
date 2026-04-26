@@ -31,7 +31,6 @@ class TrueAsyncRuntime extends SymfonyRuntime
 
                 public function run(): int
                 {
-                    $this->server->prepareApp();
                     $this->server->start();
 
                     return 0;
