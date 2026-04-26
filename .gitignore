@@ -18,3 +18,4 @@ phpunit.result.cache
 CLAUDE.md
 DEVLOG.md
 docker-proxy.sh
+tmp
