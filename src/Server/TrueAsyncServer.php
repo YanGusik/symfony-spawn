@@ -23,6 +23,10 @@ class TrueAsyncServer implements ServerInterface
 
     public function start(): void
     {
+        if (!$this->kernel->getContainer()) {
+            $this->kernel->boot();
+        }
+
         if (!class_exists(HttpServer::class)) {
             throw new \RuntimeException('TrueAsync extension is not loaded.');
         }
