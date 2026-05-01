@@ -40,7 +40,7 @@ class AsyncConnection extends DBALConnection
         parent::setAutoCommit($autoCommit);
     }
 
-    public function connect(): \Doctrine\DBAL\Driver\Connection
+    protected function connect(): \Doctrine\DBAL\Driver\Connection
     {
         // Recursion guard: beginTransaction() sets DB_IN_BEGIN before calling connect(),
         // so we skip auto-begin logic entirely to prevent double-BEGIN.
