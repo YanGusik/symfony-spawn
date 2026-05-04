@@ -16,35 +16,49 @@ class TrueAsyncServer implements ServerInterface
 {
     public function __construct(
         private readonly HttpKernelInterface $kernel,
-        private readonly string $host,
-        private readonly int $port,
-        private readonly array $options = []
-    ) {}
+        private readonly string              $host,
+        private readonly int                 $port,
+        private readonly array               $options = []
+    )
+    {
+    }
 
     public function start(): void
     {
-        $config = new HttpServerConfig();
-        $config->addListener($this->host, $this->port);
-        $config->addListener($this->host, 8443, true);
+        try {
+            $config = new HttpServerConfig();
+            $config->addListener($this->host, $this->port);
 
-        $config->setReadTimeout($this->options['read_timeout'] ?? 60);
-        $config->setWriteTimeout($this->options['write_timeout'] ?? 60);
+            $config->addListener($this->host, 8443, false); // TODO: fix later
+            $config->setMaxBodySize(32 * 1024 * 1024); // temporary
 
-        $server = new HttpServer($config);
-        $server->addHttpHandler(function (HttpRequest $request, HttpResponse $response) {
-            $request->awaitBody();
+            $config->setReadTimeout($this->options['read_timeout'] ?? 60);
+            $config->setWriteTimeout($this->options['write_timeout'] ?? 60);
 
-            $sfRequest = $this->convertRequest($request);
-            $sfResponse = $this->kernel->handle($sfRequest);
+            $server = new HttpServer($config);
+            $server->addHttpHandler(function (HttpRequest $request, HttpResponse $response) {
+                $request->awaitBody();
 
-            $this->applyResponse($sfResponse, $response);
+                $sfRequest = $this->convertRequest($request);
+                $sfResponse = $this->kernel->handle($sfRequest);
 
-            if ($this->kernel instanceof TerminableInterface) {
-                $this->kernel->terminate($sfRequest, $sfResponse);
-            }
-        });
+                $this->applyResponse($sfResponse, $response);
 
-        $server->start();
+                if ($this->kernel instanceof TerminableInterface) {
+                    $this->kernel->terminate($sfRequest, $sfResponse);
+                }
+            });
+
+            $server->start();
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "\n!!! FATAL SERVER ERROR !!!\n");
+            fwrite(STDERR, "Message: " . $e->getMessage() . "\n");
+            fwrite(STDERR, "File: " . $e->getFile() . ":" . $e->getLine() . "\n");
+            fwrite(STDERR, "Trace:\n" . $e->getTraceAsString() . "\n");
+
+            sleep(2);
+            exit(1);
+        }
     }
 
     private function convertRequest(HttpRequest $request): Request
