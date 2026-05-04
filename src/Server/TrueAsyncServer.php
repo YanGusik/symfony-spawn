@@ -25,12 +25,15 @@ class TrueAsyncServer implements ServerInterface
     {
         $config = new HttpServerConfig();
         $config->addListener($this->host, $this->port);
+        $config->addListener($this->host, 8443, true);
 
         $config->setReadTimeout($this->options['read_timeout'] ?? 60);
         $config->setWriteTimeout($this->options['write_timeout'] ?? 60);
 
         $server = new HttpServer($config);
         $server->addHttpHandler(function (HttpRequest $request, HttpResponse $response) {
+            $request->awaitBody();
+
             $sfRequest = $this->convertRequest($request);
             $sfResponse = $this->kernel->handle($sfRequest);
 
