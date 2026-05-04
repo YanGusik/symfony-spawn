@@ -107,6 +107,7 @@ class TrueAsyncRuntime extends SymfonyRuntime
             return new DevServer($kernel, $options['host'], $options['port']);
         }
 
+        echo "Start TrueAsyncServer with 1 worker on {$options['host']}:{$options['port']}...\n";
         return new TrueAsyncServer($kernel, $options['host'], $options['port'], $options);
     }
 
