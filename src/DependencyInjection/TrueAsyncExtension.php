@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Spawn\Symfony\DependencyInjection;
 
 use Symfony\Component\Config\FileLocator;
@@ -15,6 +17,7 @@ class TrueAsyncExtension extends Extension
         $config        = $this->processConfiguration($configuration, $configs);
 
         $container->setParameter('true_async.db_pool', $config['db_pool']);
+        $container->setParameter('true_async.server', $config['server']);
 
         $loader = new PhpFileLoader($container, new FileLocator(dirname(__DIR__, 2) . '/config'));
         $loader->load('services.php');
