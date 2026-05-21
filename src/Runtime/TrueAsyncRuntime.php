@@ -8,6 +8,9 @@ use Spawn\Symfony\Contracts\ServerInterface;
 use Spawn\Symfony\Server\DevServer;
 use Spawn\Symfony\Server\FrankenPhpServer;
 use Spawn\Symfony\Server\TrueAsyncServer;
+use Symfony\Bundle\FrameworkBundle\Console\Application;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\NullOutput;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Component\Runtime\RunnerInterface;
@@ -145,6 +148,17 @@ class TrueAsyncRuntime extends SymfonyRuntime
                 $kernelClass  = $this->kernelClass;
                 $env          = $this->env;
                 $debug        = $this->debug;
+
+                // Warm the kernel cache once, here in the single main thread,
+                // before any worker is spawned. Otherwise every worker thread
+                // races to compile the container and warm caches into the same
+                // var/cache directory, corrupting it — workers then fail to boot.
+                if (is_a($kernelClass, KernelInterface::class, true)) {
+                    $warmupKernel = new $kernelClass($env, $debug);
+                    $console      = new Application($warmupKernel);
+                    $console->setAutoExit(false);
+                    $console->run(new ArrayInput(['command' => 'cache:warmup']), new NullOutput());
+                }
 
                 fprintf(
                     STDERR,
