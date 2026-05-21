@@ -159,7 +159,10 @@ class TrueAsyncRuntime extends SymfonyRuntime
 
                     for ($i = 0; $i < $workersCount; $i++) {
                         $threads[] = spawn_thread(
-                            task: function () use ($envVars, $autoloadPath, $kernelClass, $env, $debug, $host, $port, $options): void {
+                            // Closures handed to spawn_thread() are transferred to a fresh
+                            // worker thread; they must be static so they do not carry $this
+                            // (the anonymous runner class is undefined in the worker).
+                            task: static function () use ($envVars, $autoloadPath, $kernelClass, $env, $debug, $host, $port, $options): void {
                                 // Restore environment inside worker thread
                                 foreach ($envVars as $k => $v) {
                                     if ($v !== null) {
@@ -190,7 +193,7 @@ class TrueAsyncRuntime extends SymfonyRuntime
 
                                 $server->start();
                             },
-                            bootloader: function () use ($autoloadPath): void {
+                            bootloader: static function () use ($autoloadPath): void {
                                 if (file_exists($autoloadPath)) {
                                     require_once $autoloadPath;
                                 }
