@@ -8,6 +8,9 @@ use Spawn\Symfony\Contracts\ServerInterface;
 use Spawn\Symfony\Server\DevServer;
 use Spawn\Symfony\Server\FrankenPhpServer;
 use Spawn\Symfony\Server\TrueAsyncServer;
+use Symfony\Bundle\FrameworkBundle\Console\Application;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\NullOutput;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Component\Runtime\RunnerInterface;
@@ -146,6 +149,17 @@ class TrueAsyncRuntime extends SymfonyRuntime
                 $env          = $this->env;
                 $debug        = $this->debug;
 
+                // Warm the kernel cache once, here in the single main thread,
+                // before any worker is spawned. Otherwise every worker thread
+                // races to compile the container and warm caches into the same
+                // var/cache directory, corrupting it — workers then fail to boot.
+                if (is_a($kernelClass, KernelInterface::class, true)) {
+                    $warmupKernel = new $kernelClass($env, $debug);
+                    $console      = new Application($warmupKernel);
+                    $console->setAutoExit(false);
+                    $console->run(new ArrayInput(['command' => 'cache:warmup']), new NullOutput());
+                }
+
                 fprintf(
                     STDERR,
                     "[true-async-server] Starting %d workers on %s:%d...\n",
@@ -159,7 +173,10 @@ class TrueAsyncRuntime extends SymfonyRuntime
 
                     for ($i = 0; $i < $workersCount; $i++) {
                         $threads[] = spawn_thread(
-                            task: function () use ($envVars, $autoloadPath, $kernelClass, $env, $debug, $host, $port, $options): void {
+                            // Closures handed to spawn_thread() are transferred to a fresh
+                            // worker thread; they must be static so they do not carry $this
+                            // (the anonymous runner class is undefined in the worker).
+                            task: static function () use ($envVars, $autoloadPath, $kernelClass, $env, $debug, $host, $port, $options): void {
                                 // Restore environment inside worker thread
                                 foreach ($envVars as $k => $v) {
                                     if ($v !== null) {
@@ -190,7 +207,7 @@ class TrueAsyncRuntime extends SymfonyRuntime
 
                                 $server->start();
                             },
-                            bootloader: function () use ($autoloadPath): void {
+                            bootloader: static function () use ($autoloadPath): void {
                                 if (file_exists($autoloadPath)) {
                                     require_once $autoloadPath;
                                 }
