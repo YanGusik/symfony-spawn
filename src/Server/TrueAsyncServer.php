@@ -20,48 +20,54 @@ use TrueAsync\StaticOnMissing;
 /**
  * TrueAsync HTTP server adapter for Symfony.
  *
- * Supports both single-threaded (dev) and multi-threaded (production) modes.
- * In multi-threaded mode the kernel is created via a factory inside each worker.
+ * The worker pool is owned by the TrueAsync HttpServer itself: a worker count
+ * greater than one is handed to HttpServerConfig::setWorkers(), and start()
+ * spawns the pool, re-binds the listeners under SO_REUSEPORT and replicates
+ * the config + handler to every worker. This adapter therefore never spawns
+ * threads on its own.
+ *
+ * The request handler MUST be a free `static` closure capturing only scalars:
+ * the pool replicates it to each worker via transfer_obj, and that path does
+ * not support closures bound to an object (`$this`) — unlike spawn_thread, it
+ * crashes on them. The kernel is therefore described by class name + env and
+ * built lazily, once per worker, inside the handler.
  */
 final class TrueAsyncServer implements ServerInterface
 {
     /**
-     * @param string                               $host          Bind host
-     * @param int                                  $port          Primary port (fallback when listeners not configured)
-     * @param array<string, mixed>                 $options       Server configuration (listeners, TLS, static handlers, etc.)
-     * @param \Closure|null                        $kernelFactory  Factory returning HttpKernelInterface; required for start()
+     * The $options array describes the kernel with transfer-safe scalars:
+     *
+     *   kernel_class  string                  Kernel class name
+     *   kernel_env    string                  Kernel environment (default "prod")
+     *   kernel_debug  bool                    Kernel debug flag
+     *   env_vars      array<string, scalar>   Env vars to restore inside the worker
+     *
+     * @param string               $host         Bind host
+     * @param int                  $port         Primary port (fallback when listeners not configured)
+     * @param array<string, mixed> $options      Server + kernel configuration
+     * @param string|null          $autoloadPath Composer autoloader path, required by worker threads
      */
     public function __construct(
-        private readonly string       $host,
-        private readonly int          $port,
-        private readonly array        $options = [],
-        private readonly ?\Closure    $kernelFactory = null,
+        private readonly string  $host,
+        private readonly int     $port,
+        private readonly array   $options = [],
+        private readonly ?string $autoloadPath = null,
     ) {
     }
 
     public function start(): void
     {
-        if ($this->kernelFactory === null) {
-            throw new \LogicException('TrueAsyncServer requires a kernelFactory in order to start.');
+        if (empty($this->options['kernel_class'])) {
+            throw new \LogicException('TrueAsyncServer requires options[kernel_class] in order to start.');
         }
 
-        $kernel = ($this->kernelFactory)();
-
-        if (!$kernel instanceof HttpKernelInterface) {
-            throw new \LogicException('kernelFactory must return an instance of HttpKernelInterface.');
-        }
-
-        if ($kernel instanceof KernelInterface) {
-            $kernel->boot();
-        }
-
-        $this->run($kernel);
+        $this->run();
     }
 
     /**
-     * Build and run the HttpServer with the given Symfony kernel.
+     * Build and run the HttpServer.
      */
-    private function run(HttpKernelInterface $kernel): void
+    private function run(): void
     {
         try {
             $config = $this->buildConfig();
@@ -69,13 +75,34 @@ final class TrueAsyncServer implements ServerInterface
 
             $this->registerStaticHandlers($server);
 
-            $server->addHttpHandler(function (HttpRequest $request, HttpResponse $response) use ($kernel): void {
+            // Everything the handler needs, captured by value as scalars — the
+            // closure stays a free static closure so the worker pool can
+            // replicate it. See the class docblock.
+            $host        = $this->host;
+            $port        = $this->port;
+            $kernelClass = (string) $this->options['kernel_class'];
+            $kernelEnv   = (string) ($this->options['kernel_env'] ?? 'prod');
+            $kernelDebug = (bool) ($this->options['kernel_debug'] ?? false);
+            $envVars     = (array) ($this->options['env_vars'] ?? []);
+
+            $server->addHttpHandler(static function (HttpRequest $request, HttpResponse $response)
+                use ($host, $port, $kernelClass, $kernelEnv, $kernelDebug, $envVars): void
+            {
+                // One kernel per worker, built on the first request and reused.
+                // Referenced by class name, not self:: — a transferred closure
+                // carries no class scope.
+                static $kernel = null;
+
+                if ($kernel === null) {
+                    $kernel = TrueAsyncServer::bootKernel($kernelClass, $kernelEnv, $kernelDebug, $envVars);
+                }
+
                 $request->awaitBody();
 
-                $sfRequest  = $this->convertRequest($request);
+                $sfRequest  = TrueAsyncServer::convertRequest($request, $host, $port);
                 $sfResponse = $kernel->handle($sfRequest);
 
-                $this->applyResponse($sfResponse, $response);
+                TrueAsyncServer::applyResponse($sfResponse, $response);
 
                 if ($kernel instanceof TerminableInterface) {
                     $kernel->terminate($sfRequest, $sfResponse);
@@ -92,6 +119,38 @@ final class TrueAsyncServer implements ServerInterface
             sleep(2);
             exit(1);
         }
+    }
+
+    /**
+     * Build and boot the kernel inside a worker. $_SERVER / $_ENV are empty in
+     * freshly spawned worker threads, so the captured env vars are restored first.
+     *
+     * Public only so the transferred handler closure — which has no class
+     * scope — can reach it by class name.
+     *
+     * @param array<string, scalar> $envVars
+     */
+    public static function bootKernel(string $kernelClass, string $env, bool $debug, array $envVars): HttpKernelInterface
+    {
+        foreach ($envVars as $name => $value) {
+            if ($value !== null) {
+                $_SERVER[$name] = $value;
+                $_ENV[$name]    = $value;
+                putenv("{$name}={$value}");
+            }
+        }
+
+        $kernel = new $kernelClass($env, $debug);
+
+        if (!$kernel instanceof HttpKernelInterface) {
+            throw new \LogicException('options[kernel_class] must name an HttpKernelInterface implementation.');
+        }
+
+        if ($kernel instanceof KernelInterface) {
+            $kernel->boot();
+        }
+
+        return $kernel;
     }
 
     private function buildConfig(): HttpServerConfig
@@ -153,6 +212,24 @@ final class TrueAsyncServer implements ServerInterface
         $config->setWriteTimeout((int) ($this->options['write_timeout'] ?? 60));
         $config->setCompressionEnabled((bool) ($this->options['compression'] ?? true));
 
+        // Worker pool: HttpServer::start() spawns and supervises it. With more
+        // than one worker the config + handler are replicated to each worker,
+        // and the bootloader registers the composer autoloader there before
+        // the handler — and its lazily-built kernel — are first touched.
+        $workers = (int) ($this->options['workers'] ?? 1);
+        if ($workers > 0) {
+            $config->setWorkers($workers);
+        }
+
+        if ($workers > 1 && $this->autoloadPath !== null) {
+            $autoloadPath = $this->autoloadPath;
+            $config->setBootloader(static function () use ($autoloadPath): void {
+                if (is_file($autoloadPath)) {
+                    require_once $autoloadPath;
+                }
+            });
+        }
+
         return $config;
     }
 
@@ -193,7 +270,7 @@ final class TrueAsyncServer implements ServerInterface
         }
     }
 
-    private function convertRequest(HttpRequest $request): Request
+    public static function convertRequest(HttpRequest $request, string $host, int $port): Request
     {
         $uri    = $request->getUri();
         $path   = $request->getPath();
@@ -206,8 +283,8 @@ final class TrueAsyncServer implements ServerInterface
             'PATH_INFO'         => $path,
             'QUERY_STRING'      => http_build_query($query),
             'SERVER_PROTOCOL'   => 'HTTP/' . $request->getHttpVersion(),
-            'SERVER_NAME'       => $this->host,
-            'SERVER_PORT'       => $this->port,
+            'SERVER_NAME'       => $host,
+            'SERVER_PORT'       => $port,
             'DOCUMENT_URI'      => $path,
             'SCRIPT_NAME'       => '',
             'SCRIPT_FILENAME'   => '',
@@ -228,14 +305,14 @@ final class TrueAsyncServer implements ServerInterface
             $query,
             $request->getPost(),
             [],
-            $this->parseCookies($request),
+            self::parseCookies($request),
             $request->getFiles(),
             $server,
             $request->getBody()
         );
     }
 
-    private function applyResponse(SymfonyResponse $sfRes, HttpResponse $res): void
+    public static function applyResponse(SymfonyResponse $sfRes, HttpResponse $res): void
     {
         $res->setStatusCode($sfRes->getStatusCode());
 
@@ -251,7 +328,10 @@ final class TrueAsyncServer implements ServerInterface
         $res->end();
     }
 
-    private function parseCookies(HttpRequest $request): array
+    /**
+     * @return array<string, string>
+     */
+    private static function parseCookies(HttpRequest $request): array
     {
         $header = $request->getHeader('cookie') ?? '';
         if ($header === '') {

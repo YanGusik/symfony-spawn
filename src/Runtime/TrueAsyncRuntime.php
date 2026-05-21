@@ -8,14 +8,13 @@ use Spawn\Symfony\Contracts\ServerInterface;
 use Spawn\Symfony\Server\DevServer;
 use Spawn\Symfony\Server\FrankenPhpServer;
 use Spawn\Symfony\Server\TrueAsyncServer;
+use Symfony\Bundle\FrameworkBundle\Console\Application;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\NullOutput;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Component\Runtime\RunnerInterface;
 use Symfony\Component\Runtime\SymfonyRuntime;
-use function Async\await;
-use function Async\await_all;
-use function Async\spawn;
-use function Async\spawn_thread;
 
 class TrueAsyncRuntime extends SymfonyRuntime
 {
@@ -27,16 +26,17 @@ class TrueAsyncRuntime extends SymfonyRuntime
 
         $options = $this->resolveOptions();
 
-        // Dev / FrankenPHP / single-threaded fallback
+        // Dev / FrankenPHP / no-extension fallback. Everything else — including
+        // a single worker — goes through the TrueAsync HttpServer, which owns
+        // its worker pool internally via HttpServerConfig::setWorkers().
         if ($options['use_dev']
             || ($_SERVER['FRANKENPHP_WORKER'] ?? false)
             || !class_exists(\TrueAsync\HttpServer::class)
-            || $options['workers'] <= 1
         ) {
             return $this->createDevRunner($application, $options);
         }
 
-        return $this->createMultiThreadedRunner($application, $options);
+        return $this->createServerRunner($application, $options);
     }
 
     /**
@@ -72,27 +72,14 @@ class TrueAsyncRuntime extends SymfonyRuntime
         ];
     }
 
+    /**
+     * @param array<string, mixed> $options
+     */
     private function createDevRunner(HttpKernelInterface $kernel, array $options): RunnerInterface
     {
-        if ($_SERVER['FRANKENPHP_WORKER'] ?? false) {
-            $server = new FrankenPhpServer($kernel);
-            return new class($server) implements RunnerInterface {
-                public function __construct(private readonly ServerInterface $server) {}
-                public function run(): int { $this->server->start(); return 0; }
-            };
-        }
-
-        if ($options['use_dev'] || !class_exists(\TrueAsync\HttpServer::class)) {
-            $server = new DevServer($kernel, $options['host'], $options['port']);
-            return new class($server) implements RunnerInterface {
-                public function __construct(private readonly ServerInterface $server) {}
-                public function run(): int { $this->server->start(); return 0; }
-            };
-        }
-
-        // Single-threaded TrueAsync (1 worker)
-        $kernelFactory = static fn(): HttpKernelInterface => $kernel;
-        $server = new TrueAsyncServer($options['host'], $options['port'], $options, $kernelFactory);
+        $server = ($_SERVER['FRANKENPHP_WORKER'] ?? false)
+            ? new FrankenPhpServer($kernel)
+            : new DevServer($kernel, $options['host'], $options['port']);
 
         return new class($server) implements RunnerInterface {
             public function __construct(private readonly ServerInterface $server) {}
@@ -100,19 +87,81 @@ class TrueAsyncRuntime extends SymfonyRuntime
         };
     }
 
-    private function createMultiThreadedRunner(HttpKernelInterface $kernel, array $options): RunnerInterface
+    /**
+     * Build the TrueAsync HttpServer runner.
+     *
+     * The kernel cache is warmed once here, in the single main thread, before
+     * the server's worker pool starts — otherwise every worker would race to
+     * compile the container into the same var/cache directory and corrupt it.
+     *
+     * The kernel itself is described to the server by transfer-safe scalars
+     * (class name, env, debug, env vars), never an object or closure, so the
+     * config + handler replicate cleanly across the pool. Each worker builds
+     * its own kernel lazily.
+     *
+     * @param array<string, mixed> $options
+     */
+    private function createServerRunner(HttpKernelInterface $kernel, array $options): RunnerInterface
     {
-        $kernelClass  = get_class($kernel);
-        $env          = $_SERVER['APP_ENV'] ?? 'prod';
-        $debug        = (bool) ($_SERVER['APP_DEBUG'] ?? false);
-        $autoloadPath = $options['autoload'];
+        $options['kernel_class'] = $kernel::class;
+        $options['kernel_env']   = (string) ($_SERVER['APP_ENV'] ?? 'prod');
+        $options['kernel_debug'] = (bool) ($_SERVER['APP_DEBUG'] ?? false);
+        $options['env_vars']     = $this->captureEnvVars();
 
-        // Capture only env vars that Symfony / Doctrine / app actually need.
-        // ($_SERVER and $_ENV are empty in spawned threads)
+        return new class($options) implements RunnerInterface {
+            /** @param array<string, mixed> $options */
+            public function __construct(private readonly array $options) {}
+
+            public function run(): int
+            {
+                $options = $this->options;
+
+                // Warm the kernel cache once, in this single main thread,
+                // before the worker pool is started.
+                $kernelClass = $options['kernel_class'];
+                if (is_a($kernelClass, KernelInterface::class, true)) {
+                    $warmupKernel = new $kernelClass($options['kernel_env'], $options['kernel_debug']);
+                    $console      = new Application($warmupKernel);
+                    $console->setAutoExit(false);
+                    $console->run(new ArrayInput(['command' => 'cache:warmup']), new NullOutput());
+                }
+
+                fprintf(
+                    STDERR,
+                    "[true-async-server] %d worker(s) on %s:%d\n",
+                    (int) ($options['workers'] ?? 1),
+                    $options['host'],
+                    $options['port'],
+                );
+
+                $server = new TrueAsyncServer(
+                    $options['host'],
+                    $options['port'],
+                    $options,
+                    $options['autoload'],
+                );
+
+                $server->start();
+
+                return 0;
+            }
+        };
+    }
+
+    /**
+     * Capture only env vars that Symfony / Doctrine / the app actually need.
+     * $_SERVER and $_ENV are empty in freshly spawned worker threads, so these
+     * are handed to the server and restored inside each worker.
+     *
+     * @return array<string, scalar>
+     */
+    private function captureEnvVars(): array
+    {
         $neededPrefixes = ['APP_', 'DATABASE_', 'DEFAULT_URI', 'SYMFONY_', 'TRUASYNC_', 'KERNEL', 'PHP_'];
         $envVars = [];
+
         foreach (array_merge($_ENV, $_SERVER) as $k => $v) {
-            if (!is_scalar($v) && $v !== null) {
+            if (!is_scalar($v)) {
                 continue;
             }
             foreach ($neededPrefixes as $prefix) {
@@ -123,89 +172,7 @@ class TrueAsyncRuntime extends SymfonyRuntime
             }
         }
 
-        return new class($options, $kernelClass, $env, $debug, $autoloadPath, $envVars) implements RunnerInterface {
-            public function __construct(
-                private readonly array $options,
-                private readonly string $kernelClass,
-                private readonly string $env,
-                private readonly bool $debug,
-                private readonly string $autoloadPath,
-                private readonly array $envVars,
-            ) {
-            }
-
-            public function run(): int
-            {
-                $workersCount = $this->options['workers'];
-                $host         = $this->options['host'];
-                $port         = $this->options['port'];
-                $options      = $this->options;
-                $envVars      = $this->envVars;
-                $autoloadPath = $this->autoloadPath;
-                $kernelClass  = $this->kernelClass;
-                $env          = $this->env;
-                $debug        = $this->debug;
-
-                fprintf(
-                    STDERR,
-                    "[true-async-server] Starting %d workers on %s:%d...\n",
-                    $workersCount,
-                    $host,
-                    $port
-                );
-
-                $mainCoroutine = spawn(function () use ($workersCount, $host, $port, $options, $envVars, $autoloadPath, $kernelClass, $env, $debug): void {
-                    $threads = [];
-
-                    for ($i = 0; $i < $workersCount; $i++) {
-                        $threads[] = spawn_thread(
-                            task: function () use ($envVars, $autoloadPath, $kernelClass, $env, $debug, $host, $port, $options): void {
-                                // Restore environment inside worker thread
-                                foreach ($envVars as $k => $v) {
-                                    if ($v !== null) {
-                                        $_SERVER[$k] = $v;
-                                        $_ENV[$k]    = $v;
-                                        putenv("{$k}={$v}");
-                                    }
-                                }
-
-                                if (file_exists($autoloadPath)) {
-                                    require_once $autoloadPath;
-                                }
-
-                                $kernelFactory = function () use ($kernelClass, $env, $debug): HttpKernelInterface {
-                                    $kernel = new $kernelClass($env, $debug);
-                                    if ($kernel instanceof KernelInterface) {
-                                        $kernel->boot();
-                                    }
-                                    return $kernel;
-                                };
-
-                                $server = new TrueAsyncServer(
-                                    $host,
-                                    $port,
-                                    $options,
-                                    $kernelFactory
-                                );
-
-                                $server->start();
-                            },
-                            bootloader: function () use ($autoloadPath): void {
-                                if (file_exists($autoloadPath)) {
-                                    require_once $autoloadPath;
-                                }
-                            }
-                        );
-                    }
-
-                    await_all($threads);
-                });
-
-                await($mainCoroutine);
-
-                return 0;
-            }
-        };
+        return $envVars;
     }
 
     private function detectCoreCount(): int
